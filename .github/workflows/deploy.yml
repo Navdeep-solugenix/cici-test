@@ -30,7 +30,7 @@ jobs:
       # Step 4: Build, tag, and push the Docker image to ECR
       - name: Build, tag, and push Docker image
         run: |
-          IMAGE_URI=${{ secrets.ECR_URI }}/nestjs-app:latest
+          IMAGE_URI=${{ secrets.ECR_URI }}:latest
           docker build -t $IMAGE_URI .
           docker push $IMAGE_URI
 
