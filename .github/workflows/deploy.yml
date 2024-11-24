@@ -37,6 +37,6 @@ jobs:
       # Step 5: Update ECS service
       - name: Deploy to ECS
         run: |
-          aws ecs update-service --cluster your-cluster-name \
-            --service your-service-name \
+          aws ecs update-service --cluster teampulse-backend-cluster \
+            --service teampulse-cluster-service  \
             --force-new-deployment
