@@ -1,0 +1,267 @@
+name: Build and deploy project to EC2
+on:
+  # TODO: remove after testing
+  push:
+    branches:
+      - test/*
+      - main
+  pull_request:
+    branches:
+      - development
+env:
+  BUILD_ARTIFACT_NAME: buildArtifact
+  ENV_ARTIFACT_NAME: envArtifact
+  NODE_VERSION: 20
+  EC2_USER: "ec2-user"
+  EC2_HOST: "ec2-13-201-66-137.ap-south-1.compute.amazonaws.com"
+  PROJECT_DIR: "/home/ec2-user/project"
+  SSH_KEY_PATH: "~/.ssh/id_rsa"
+  AWS_SECRETS_NAME: "dev/teampulse/actions_secrets"
+  APP_ENTRY_POINT: "main.js"
+  CLEANUP_SCRIPT: "cleanup.sh"
+  CREATE_PATH_SCRIPT: "create_path.sh"
+  DEPLOY_SCRIPT: "deploy.sh"
+jobs:
+  # lint:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v3
+  #     - name: Setup Node.js
+  #       uses: actions/setup-node@v3
+  #       with:
+  #         node-version:  ${{ env.NODE_VERSION }}
+  #     - name: Cache dependencies
+  #       id: cache
+  #       uses: actions/cache@v3
+  #       with:
+  #         path: node_modules
+  #         key: node-modules-deps-${{ hashFiles('**/package-lock.json') }}
+  #     - name: Install dependencies
+  #       if: steps.cache.outputs.cache-hit != 'true'
+  #       run: npm ci
+  #     - name: Run linter
+  #       continue-on-error: true
+  #       run: npm run lint
+  # test:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v3
+  #     - name: Setup Node.js
+  #       uses: actions/setup-node@v3
+  #       with:
+  #         node-version:  ${{ env.NODE_VERSION }}
+  #     - name: Cache dependencies
+  #       id: cache
+  #       uses: actions/cache@v3
+  #       with:
+  #         path: node_modules
+  #         key: node-modules-deps-${{ hashFiles('**/package-lock.json') }}
+  #     - name: Install dependencies
+  #       if: steps.cache.outputs.cache-hit != 'true'
+  #       run: npm ci
+  #     - name: Run tests
+  #       continue-on-error: true
+  #       run: npm run test
+  fetch-secrets:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Check out the code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2: Install AWS CLI
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli
+          
+      # Step 3: Configure AWS CLI
+      - name: Configure AWS
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set region ${{ secrets.AWS_REGION }}
+
+      # Step 4: Fetch secret from AWS Secrets Manager
+      - name: Fetch Secrets
+        id: fetch_secrets
+        run: |
+          SECRET=$(aws secretsmanager get-secret-value --secret-id ${{ env.AWS_SECRETS_NAME }} --query SecretString --output text)
+          echo "$SECRET" > env.json
+
+      # Step 5: Converting json to environment
+      - name: Converting json to .env
+        run: |
+          sudo apt-get update
+          sudo apt-get install jq
+          cat env.json | jq -r 'to_entries[] | "\(.key)=\(.value)"' > dev.env
+
+      # Step 6: Uploading environment artifacts
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.ENV_ARTIFACT_NAME }}
+          path: dev.env
+  build:
+    # needs: test
+    needs: 
+      - fetch-secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version:  ${{ env.NODE_VERSION }}
+      - name: Cache dependencies
+        id: cache
+        uses: actions/cache@v3
+        with:
+          path: node_modules
+          key: node-modules-deps-${{ hashFiles('**/package-lock.json') }}
+      - name: Install dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: npm ci
+      - name: Get env artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ env.ENV_ARTIFACT_NAME }}
+      - name: Verify .env files
+        run: ls -l
+      - name: Move env to config
+        run: sudo mv dev.env ./config/dev.env
+      - name: Run build
+        run: npm run build
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.BUILD_ARTIFACT_NAME }}
+          path: dist
+  deploy_to_staging:
+    needs: 
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ env.BUILD_ARTIFACT_NAME }}
+
+      - name: Output content
+        run: ls
+
+      - name: Add SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ env.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create clean up script
+        run: |
+          cat <<EOF > ${{ env.CLEANUP_SCRIPT }}
+          #!/bin/bash
+          
+          # Check if the directory exists
+          if [ -d "${{ env.PROJECT_DIR }}" ]; then
+            echo "Directory ${{ env.PROJECT_DIR }} exists. Removing contents..."
+          
+            # Remove all files and folders inside the directory
+            rm -rf "${{ env.PROJECT_DIR }}"/* "${{ env.PROJECT_DIR }}"/.*
+          
+            echo "All files and folders in ${{ env.PROJECT_DIR }} have been removed."
+          else
+            echo "Directory ${{ env.PROJECT_DIR }} does not exist. No action taken."
+          fi
+          EOF
+
+      - name: Create project path Script
+        run: |
+          cat <<EOF > ${{ env.CREATE_PATH_SCRIPT }}
+          # Step 1: Check if the directory exists
+          echo "Creating  '${{ env.PROJECT_DIR }}'..."
+          mkdir -p ${{ env.PROJECT_DIR }}
+          sudo chown -R ${{ env.EC2_USER }}:${{ env.EC2_USER }} ${{ env.PROJECT_DIR }}
+          echo "Directory ${{ env.PROJECT_DIR }} is now set up."
+
+      - name: Create Deploy Script
+        run: |
+          cat <<EOF > ${{ env.DEPLOY_SCRIPT }}       
+          # Step 1: Check and install Node.js
+          if ! command -v node &> /dev/null; then
+            echo "Node.js is not installed. Installing..."
+            yum install -y nodejs
+          else
+            echo "Node.js is already installed."
+          fi
+          
+          # Step 2: Check and install Git
+          if ! command -v git &> /dev/null; then
+            echo "Git is not installed. Installing..."
+            yum install -y git
+          else
+            echo "Git is already installed."
+          fi
+
+          # Step 3: Install dependencies
+          echo "Installing required dependencies..."
+          cd ${{ env.PROJECT_DIR }}
+          npm i 
+          
+          # Step 4: Check and install PM2 globally
+          if ! npm list -g | grep pm2 &> /dev/null; then
+            echo "PM2 is not installed. Installing..."
+            npm install -g pm2
+          else
+            echo "PM2 is already installed."
+          fi
+          
+          # Step 5: Remove existing running application with PM2
+          if pm2 list | grep online &> /dev/null; then
+            echo "Stopping all running PM2 applications..."
+            pm2 stop all
+            pm2 delete all
+          fi
+          
+          # Step 6: Run the new application using PM2
+          if [ -f ${{ env.APP_ENTRY_POINT}} ]; then
+            echo "Starting the new application with PM2..."
+            pm2 start ${{ env.APP_ENTRY_POINT}}
+            pm2 save
+          else
+            echo "Application entry point ${{ env.APP_ENTRY_POINT}} does not exist. Please check your setup."
+          fi
+          echo "Setup completed."
+          EOF
+
+      - name: Copy and Execute Deploy Script to EC2
+        run: |
+          # Step 1: Transfer clean up script and execute it
+          echo "Uploading and running ${{ env.CLEANUP_SCRIPT }}..."
+          scp -i ${{ env.SSH_KEY_PATH }} ${{ env.CLEANUP_SCRIPT }} ${{ env.EC2_USER }}@${{ env.EC2_HOST }}:
+          ssh -i ${{ env.SSH_KEY_PATH }} ${{ env.EC2_USER }}@${{ env.EC2_HOST }} "chmod 700 ${{ env.CLEANUP_SCRIPT }} && sudo ./${{ env.CLEANUP_SCRIPT }}"
+          echo "${{ env.CLEANUP_SCRIPT }} executed..."
+          
+          # Step 2: Transfer deploy script and create path script
+          echo "Uploading ${{ env.DEPLOY_SCRIPT }} and ${{ env.CREATE_PATH_SCRIPT }}..."
+          scp -i ${{ env.SSH_KEY_PATH }} ${{ env.DEPLOY_SCRIPT }} ${{ env.CREATE_PATH_SCRIPT }} ${{ env.EC2_USER }}@${{ env.EC2_HOST }}:
+          echo "Uploaded ${{ env.DEPLOY_SCRIPT }} and ${{ env.CREATE_PATH_SCRIPT }}..."
+          
+          # Step 3: Run create path script
+          echo "Running ${{ env.CREATE_PATH_SCRIPT }}..."
+          ssh -i ${{ env.SSH_KEY_PATH }} ${{ env.EC2_USER }}@${{ env.EC2_HOST }} "chmod 700 ${{ env.CREATE_PATH_SCRIPT }} && sudo ./${{ env.CREATE_PATH_SCRIPT }}"
+          echo "${{ env.CREATE_PATH_SCRIPT }} executed..."
+          
+          # Step 4: Transfer project files to the target directory
+          echo "Transferring project files to ${{ env.PROJECT_DIR }}..."
+          scp -r -i ${{ env.SSH_KEY_PATH }} ./* ${{ env.EC2_USER }}@${{ env.EC2_HOST }}:${{ env.PROJECT_DIR }}
+          echo "Transferred files to ${{ env.PROJECT_DIR }}..."
+          
+          # Step 5: Execute deploy script
+          echo "Running ${{ env.DEPLOY_SCRIPT }}..."
+          ssh -i ${{ env.SSH_KEY_PATH }} ${{ env.EC2_USER }}@${{ env.EC2_HOST }} "chmod 700 ${{ env.DEPLOY_SCRIPT }} && sudo ./${{ env.DEPLOY_SCRIPT }}"
+          
+          echo "Deployment completed successfully!"
